@@ -1,0 +1,716 @@
+import streamlit as st
+st.set_page_config(
+        page_title="蔬菜配送会员管理系统",
+        layout="wide",
+    )
+
+import pandas as pd
+from datetime import datetime
+from io import StringIO
+from typing import List, Tuple
+
+import query as q
+
+from sqlalchemy import create_engine, text
+
+# =====================
+# 数据库初始化与基础函数
+# =====================
+
+def init_db():
+    # PostgreSQL 在云端由你执行 SQL 初始化，这里无需本地初始化
+    return
+
+
+# =====================
+# 通用数据库操作封装
+# =====================
+
+compute_card_status = q.compute_card_status
+
+
+# =====================
+# B 端：模块 1 – 开卡与会员管理
+# =====================
+
+def page_open_card_manage():
+    st.subheader("模块1：开卡与会员管理")
+
+    with st.form("open_card_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            name = st.text_input("真实姓名", "")
+            wechat_name = st.text_input("微信名/备注", "")
+        with col2:
+            phone = st.text_input("手机号（唯一）", "")
+
+            purchase_date = st.date_input(
+                "购卡日期", value=datetime.now().date()
+            )
+
+        st.markdown("**菜卡规格选择**")
+        spec_option = st.selectbox(
+            "选择卡片规格与周期",
+            [
+                "6斤 月卡 (4次)",
+                "6斤 季卡 (12次)",
+                "6斤 年卡 (50次)",
+                "8斤 月卡 (4次)",
+                "8斤 季卡 (12次)",
+                "8斤 年卡 (50次)",
+            ],
+        )
+
+        submitted = st.form_submit_button("确认开卡/续卡")
+
+        if submitted:
+            if not name or not phone:
+                st.error("姓名与手机号为必填项。")
+            else:
+                # 解析规格
+                if spec_option.startswith("6斤"):
+                    spec_kg = 6
+                else:
+                    spec_kg = 8
+
+                if "月卡" in spec_option:
+                    cycle_type = "month"
+                elif "季卡" in spec_option:
+                    cycle_type = "quarter"
+                else:
+                    cycle_type = "year"
+
+                # 判断会员是否存在
+                existing_member = q.get_member_by_phone(phone)
+                if existing_member:
+                    member_id = int(existing_member["id"])
+                    st.info(f"检测到老会员：{existing_member['name']}，将在其名下新增菜卡。")
+                else:
+                    member_id = q.create_member(name, wechat_name, phone)
+                    st.success(f"已创建新会员档案：{name}。")
+
+                # 创建菜卡
+                purchase_dt = datetime.combine(purchase_date, datetime.min.time())
+                card_id = q.create_card_with_debt_fill(member_id, spec_kg, cycle_type, purchase_dt.date())
+
+                st.success(f"开卡/续卡成功！卡片ID：{card_id}")
+
+
+# =====================
+# B 端：模块 2 – 批量/手动 配送扣卡
+# =====================
+
+def parse_pasted_table(text: str) -> Tuple[pd.DataFrame, List[str]]:
+    errors = []
+    if not text.strip():
+        errors.append("请先在文本框中粘贴内容。")
+        return pd.DataFrame(), errors
+
+    buffer = StringIO(text)
+
+    # 尝试多种分隔符
+    parsed = None
+    for sep in ["\t", ",", r"\s+"]:
+        try:
+            buffer.seek(0)
+            parsed = pd.read_csv(buffer, sep=sep, engine="python")
+            if parsed.shape[1] >= 3:
+                break
+        except Exception:
+            parsed = None
+
+    if parsed is None or parsed.shape[1] < 3:
+        errors.append("无法识别粘贴内容，请确认为 3 列（姓名、手机号、实发斤数），可为 Excel 复制结果。")
+        return pd.DataFrame(), errors
+
+    # 尝试列名映射
+    cols = list(parsed.columns)
+    mapping = {}
+
+    def find_col(candidates):
+        for c in cols:
+            for cand in candidates:
+                if cand in str(c):
+                    return c
+        return None
+
+    name_col = find_col(["姓名", "name", "客户"])
+    phone_col = find_col(["手机号", "电话", "phone"])
+    weight_col = find_col(["实发斤数", "重量", "斤数", "weight"])
+
+    if name_col is None or phone_col is None or weight_col is None:
+        if len(cols) >= 3:
+            name_col, phone_col, weight_col = cols[0], cols[1], cols[2]
+        else:
+            errors.append("无法识别列名，请确保包含 姓名、手机号、实发斤数。")
+            return pd.DataFrame(), errors
+
+    df = parsed[[name_col, phone_col, weight_col]].copy()
+    df.columns = ["name", "phone", "weight"]
+    # 清洗
+    df["phone"] = df["phone"].astype(str).str.strip()
+    df["name"] = df["name"].astype(str).str.strip()
+    try:
+        df["weight"] = pd.to_numeric(df["weight"], errors="coerce")
+    except Exception:
+        df["weight"] = None
+
+    df = df.dropna(subset=["weight"])
+    return df, errors
+
+
+def batch_deduction_ui():
+    st.markdown("#### 批量粘贴扣卡")
+
+    text = st.text_area(
+        "从 Excel 直接复制 3 列数据粘贴到这里（表头：姓名、手机号、实发斤数）",
+        height=180,
+        key="batch_paste_input",
+    )
+
+    if "batch_success_df" not in st.session_state:
+        st.session_state.batch_success_df = pd.DataFrame()
+    if "batch_error_df" not in st.session_state:
+        st.session_state.batch_error_df = pd.DataFrame()
+
+    if st.button("解析并匹配菜卡"):
+        df, errs = parse_pasted_table(text)
+        if errs:
+            for e in errs:
+                st.error(e)
+            return
+
+        if df.empty:
+            st.warning("没有有效数据行。")
+            return
+
+        success_rows = []
+        error_rows = []
+
+        for _, row in df.iterrows():
+            name = row["name"]
+            phone = str(row["phone"]).strip()
+            weight = float(row["weight"])
+
+            card = q.choose_card_for_deduction(phone)
+            if card is None:
+                error_rows.append(
+                    {
+                        "姓名": name,
+                        "手机号": phone,
+                        "实发斤数": weight,
+                        "异常原因": "未找到有效菜卡",
+                    }
+                )
+                continue
+
+            remaining = float(card["remaining_weight"])
+            after_remaining = remaining - weight
+            success_rows.append(
+                {
+                    "姓名": name,
+                    "手机号": phone,
+                    "实发斤数": weight,
+                    "卡ID": card["id"],
+                    "卡型": f"{card['spec_kg_per_delivery']}斤-{card['cycle_type']}",
+                    "剩余斤数(扣前)": remaining,
+                    "预计剩余斤数(扣后)": after_remaining,
+                }
+            )
+
+        st.session_state.batch_success_df = pd.DataFrame(success_rows)
+        st.session_state.batch_error_df = pd.DataFrame(error_rows)
+
+    if not st.session_state.batch_success_df.empty:
+        st.markdown("##### 待扣款区（已匹配菜卡，允许扣超）")
+        df_show = st.session_state.batch_success_df.copy()
+        overdraft_rows = df_show[df_show["预计剩余斤数(扣后)"] < 0]
+        if not overdraft_rows.empty:
+            st.markdown(
+                f"<span style='color:red'>提示：本次待扣款中有 {len(overdraft_rows)} 条将产生欠费（扣后为负数）。</span>",
+                unsafe_allow_html=True,
+            )
+        st.dataframe(df_show, use_container_width=True)
+
+        if st.button("一键确认扣款"):
+            df_success = st.session_state.batch_success_df
+            if df_success.empty:
+                st.info("暂无待扣款记录。")
+            else:
+                success_count = 0
+                overdraft_happened = False
+                st.markdown("**本次扣卡明细核对：**")
+                for _, row in df_success.iterrows():
+                    card_id = int(row["卡ID"])
+                    weight = float(row["实发斤数"])
+                    before_remain = float(row["剩余斤数(扣前)"])
+                    after_remain = before_remain - weight
+                    try:
+                        q.deduct_card(card_id, weight, status="成功扣卡")
+                        success_count += 1
+                        st.write(
+                            f"会员：{row['姓名']} / {row['手机号']} | 扣前：{before_remain:.2f} 斤 | 扣除：{weight:.2f} 斤 | 扣后：{after_remain:.2f} 斤"
+                        )
+                        if after_remain < 0:
+                            overdraft_happened = True
+                            st.markdown(
+                                f"<span style='color:red'>该次扣卡已产生欠费 {abs(after_remain):.2f} 斤，请及时提醒客户续卡。</span>",
+                                unsafe_allow_html=True,
+                            )
+                    except Exception as e:
+                        st.error(f"卡ID {card_id} 扣款失败：{e}")
+
+                st.success(f"已成功处理 {success_count} 条扣款记录。")
+                if overdraft_happened:
+                    st.markdown(
+                        "<span style='color:red'>本次批量扣卡中存在欠费情况，请优先关注红色标记的会员。</span>",
+                        unsafe_allow_html=True,
+                    )
+                st.session_state.batch_success_df = pd.DataFrame()
+
+    if not st.session_state.batch_error_df.empty:
+        st.markdown("##### 异常区（未找到匹配菜卡）")
+        error_df = st.session_state.batch_error_df.copy()
+
+        not_found_count = (error_df["异常原因"] == "未找到有效菜卡").sum()
+        if not_found_count:
+            st.warning(
+                f"共有 {not_found_count} 条记录未找到匹配的会员/菜卡，请核对手机号或是否已开卡。"
+            )
+
+        st.dataframe(error_df, use_container_width=True)
+
+        st.markdown("**对异常记录可以逐条处理：**")
+        new_error_rows = []
+        for idx, row in error_df.iterrows():
+            cols = st.columns([3, 1, 1])
+            with cols[0]:
+                st.write(
+                    f"{row['姓名']} / {row['手机号']} / {row['实发斤数']} 斤 —— {row['异常原因']}"
+                )
+            with cols[1]:
+                ignore = st.button("忽略", key=f"ignore_{idx}")
+            with cols[2]:
+                retail = st.button("散客单买", key=f"retail_{idx}")
+
+            if retail:
+                q.insert_retail_record(float(row["实发斤数"]), status="非会员零售")
+                st.success(f"已作为散客单买记录写入：{row['姓名']} / {row['实发斤数']}斤")
+            elif ignore:
+                st.info(f"已忽略：{row['姓名']} / {row['手机号']}")
+            else:
+                new_error_rows.append(row)
+
+        st.session_state.batch_error_df = pd.DataFrame(new_error_rows)
+
+        if st.session_state.batch_error_df.empty:
+            st.info("当前异常记录已全部处理。")
+
+
+def manual_deduction_ui():
+    st.markdown("#### 单独手动扣卡")
+
+    # 替换为 q.run_query
+    df_cards = q.run_query(
+        """
+        SELECT cards.*, members.name AS member_name, members.phone
+        FROM cards
+        JOIN members ON cards.member_id = members.id
+        WHERE cards.remaining_weight > 0
+        ORDER BY members.name ASC, cards.purchase_date ASC, cards.id ASC
+        """
+    )
+
+    if df_cards.empty:
+        st.info("当前没有可用的菜卡。")
+        return
+
+    options = []
+    for _, r in df_cards.iterrows():
+        total_w = float(r["total_weight"])
+        rem_w = float(r["remaining_weight"])
+        status = compute_card_status(total_w, rem_w)
+        display = (
+            f"{r['member_name']}({r['phone']}) - 卡ID:{r['id']} - "
+            f"{r['spec_kg_per_delivery']}斤 {r['cycle_type']} "
+            f"剩余:{rem_w}斤 状态:{status}"
+        )
+        options.append((display, r.to_dict()))
+
+    labels = [o[0] for o in options]
+    selected_label = st.selectbox("选择需要扣卡的会员菜卡（支持输入姓名搜索）", labels)
+    selected_row = None
+    for label, r in options:
+        if label == selected_label:
+            selected_row = r
+            break
+
+    weight = st.number_input("实发斤数", min_value=0.0, step=0.5, value=0.0)
+
+    if st.button("确认手动扣卡"):
+        if weight <= 0:
+            st.error("实发斤数必须大于 0。")
+            return
+
+        card_id = selected_row["id"]
+        remaining = float(selected_row["remaining_weight"])
+        spec_kg = int(selected_row["spec_kg_per_delivery"])
+
+        if weight < spec_kg:
+            diff = spec_kg - weight
+            st.warning(f"⚠️ 少点 {diff:.2f} 斤，请提醒客户确认。")
+
+        try:
+            before_remain = remaining
+            after_remain = before_remain - weight
+            q.deduct_card(card_id, weight, status="成功扣卡")
+            st.success(
+                f"手动扣卡成功。会员：{selected_row['member_name']}({selected_row['phone']}) | 扣前：{before_remain:.2f} 斤 | 扣除：{weight:.2f} 斤 | 扣后：{after_remain:.2f} 斤"
+            )
+            if after_remain < 0:
+                st.markdown(
+                    f"<span style='color:red'>当前菜卡已产生欠费 {abs(after_remain):.2f} 斤，请及时提醒客户续卡。</span>",
+                    unsafe_allow_html=True,
+                )
+        except Exception as e:
+            st.error(f"扣卡失败：{e}")
+
+
+def admin_db_browser():
+    st.markdown("#### 数据库原始数据浏览")
+
+    table = st.selectbox("选择数据表", ["records", "cards", "members"], index=0)
+    search = st.text_input("搜索关键字（支持模糊匹配，作用于当前表所有字段）", "")
+
+    # 替换为 q.run_query
+    if table == "members":
+        df = q.run_query("SELECT * FROM members ORDER BY id DESC")
+    elif table == "cards":
+        df = q.run_query(
+            """
+            SELECT cards.*, members.name AS member_name, members.phone
+            FROM cards
+            JOIN members ON cards.member_id = members.id
+            ORDER BY cards.purchase_date ASC, cards.id ASC
+            """
+        )
+    else:  # records
+        df = q.run_query(
+            """
+            SELECT records.*, members.name AS member_name, members.phone
+            FROM records
+            LEFT JOIN members ON records.member_id = members.id
+            ORDER BY records.id DESC
+            """
+        )
+
+    if not df.empty and search.strip():
+        mask = df.astype(str).apply(
+            lambda col: col.str.contains(search.strip(), case=False, na=False)
+        )
+        df_display = df[mask.any(axis=1)].copy()
+    else:
+        df_display = df.copy()
+
+    if table == "cards" and not df_display.empty:
+        df_display["卡片状态"] = df_display.apply(
+            lambda r: compute_card_status(
+                float(r["total_weight"]), float(r["remaining_weight"])
+            ),
+            axis=1,
+        )
+
+    st.dataframe(df_display, use_container_width=True)
+
+
+def edit_records_ui():
+    st.markdown("#### 修改历史扣卡记录（同步调整菜卡余额）")
+
+    search = st.text_input("搜索关键字（手机号 / 姓名 / 状态等）", "")
+
+    # 替换为 q.run_query
+    df = q.run_query(
+        """
+        SELECT records.*, members.name AS member_name, members.phone
+        FROM records
+        LEFT JOIN members ON records.member_id = members.id
+        ORDER BY records.id DESC
+        """
+    )
+
+    if df.empty:
+        st.info("当前暂无扣卡流水记录。")
+        return
+
+    if search.strip():
+        mask = df.astype(str).apply(
+            lambda col: col.str.contains(search.strip(), case=False, na=False)
+        )
+        df_display = df[mask.any(axis=1)].copy()
+    else:
+        df_display = df.copy()
+
+    st.dataframe(df_display, use_container_width=True)
+
+    if df_display.empty:
+        return
+
+    st.markdown("**选择一条记录进行修改或删除：**")
+
+    labels = []
+    id_map = {}
+    for _, r in df_display.iterrows():
+        label = f"ID:{r['id']} | 扣卡:{r['op_date']} | 配送:{r['delivery_date']} | 斤数:{r['weight']} | 状态:{r['status']}"
+        if "member_name" in r and pd.notna(r["member_name"]):
+            label += f" | 姓名:{r['member_name']}"
+        if "phone" in r and pd.notna(r["phone"]):
+            label += f" | 手机:{r['phone']}"
+        labels.append(label)
+        id_map[label] = int(r["id"])
+
+    selected_label = st.selectbox("选择记录", labels)
+    selected_id = id_map[selected_label]
+    selected_row = df_display[df_display["id"] == selected_id].iloc[0]
+
+    new_weight = st.number_input(
+        "调整后的实发斤数（将同步调整菜卡余额）",
+        min_value=0.0,
+        step=0.5,
+        value=float(selected_row["weight"]),
+    )
+
+    col_u, col_d = st.columns(2)
+    with col_u:
+        if st.button("更新该记录斤数", key="btn_update_record"):
+            try:
+                q.update_record_weight(selected_id, new_weight)
+                st.success(
+                    f"记录 ID {selected_id} 的斤数已更新为 {new_weight}，对应菜卡余额已自动同步调整。"
+                )
+            except Exception as e:
+                st.error(f"更新失败：{e}")
+    with col_d:
+        if st.button("删除该记录", key="btn_delete_record"):
+            try:
+                q.delete_record(selected_id)
+                st.success(
+                    f"记录 ID {selected_id} 已删除，对应菜卡余额已自动回滚。"
+                )
+            except Exception as e:
+                st.error(f"删除失败：{e}")
+
+
+def page_batch_and_manual_deduction():
+    st.subheader("模块2：批量/手动 配送扣卡")
+
+    tab1, tab2, tab3 = st.tabs(
+        ["批量粘贴扣卡", "单独手动扣卡", "修改历史扣卡记录"]
+    )
+
+    with tab1:
+        batch_deduction_ui()
+    with tab2:
+        manual_deduction_ui()
+    with tab3:
+        edit_records_ui()
+
+
+# =====================
+# B 端：模块 3 – 数据看板与日结汇总
+# =====================
+
+def page_dashboard():
+    st.subheader("模块3：数据看板与日结汇总")
+
+    mode = st.radio(
+        "按日期维度筛选",
+        ["按扣卡日期", "按配送日期"],
+        horizontal=True,
+    )
+
+    today = datetime.now().date()
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("开始日期", value=today)
+    with col2:
+        end_date = st.date_input("结束日期", value=today)
+
+    if start_date > end_date:
+        st.error("开始日期不能晚于结束日期。")
+        return
+
+    date_field = "op_date" if mode == "按扣卡日期" else "delivery_date"
+    df = q.query_records_with_join(date_field, start_date, end_date)
+
+    if df.empty:
+        st.info("所选日期范围内暂无记录。")
+        return
+
+    # 顶部指标
+    total_orders = len(df)
+    total_weight = df["weight"].sum()
+
+    m1, m2 = st.columns(2)
+    m1.metric("总订单单数", f"{total_orders}")
+    m2.metric("总发货斤数", f"{total_weight:.2f} 斤")
+
+    if "total_weight" in df.columns and "remaining_weight" in df.columns:
+        df["card_status"] = df.apply(
+            lambda r: compute_card_status(
+                float(r["total_weight"]) if pd.notna(r["total_weight"]) else 0.0,
+                float(r["remaining_weight"])
+                if pd.notna(r["remaining_weight"])
+                else 0.0,
+            ),
+            axis=1,
+        )
+    else:
+        df["card_status"] = ""
+
+    display_df = df[
+        [
+            date_field,
+            "delivery_date",
+            "member_name",
+            "phone",
+            "weight",
+            "status",
+            "card_id",
+            "spec_kg_per_delivery",
+            "cycle_type",
+            "card_status",
+        ]
+    ].rename(
+        columns={
+            date_field: "日期",
+            "delivery_date": "配送日期",
+            "member_name": "姓名",
+            "phone": "手机号",
+            "weight": "实发斤数",
+            "status": "扣除状态",
+            "card_id": "菜卡ID",
+            "spec_kg_per_delivery": "单次规格(斤)",
+            "cycle_type": "卡片周期",
+            "card_status": "卡片状态",
+        }
+    )
+
+    st.markdown("#### 明细列表")
+    st.dataframe(display_df, use_container_width=True)
+
+
+def page_db_admin():
+    st.subheader("模块4：数据库原始表查询")
+    admin_db_browser()
+
+
+def page_debt_reminder():
+    st.subheader("模块5：欠费续卡提醒")
+    df = q.debt_cards()
+
+    if df.empty:
+        st.info("当前暂无欠费菜卡。")
+        return
+
+    df["total_weight"] = pd.to_numeric(
+        df.get("total_weight", 0), errors="coerce"
+    ).fillna(0)
+    df["remaining_weight"] = pd.to_numeric(
+        df.get("remaining_weight", 0), errors="coerce"
+    ).fillna(0)
+
+    df["欠费斤数"] = df["remaining_weight"].apply(lambda x: abs(float(x)))
+    df["卡片状态"] = df.apply(
+        lambda r: compute_card_status(
+            float(r["total_weight"]), float(r["remaining_weight"])
+        ),
+        axis=1,
+    )
+
+    display_df = df[
+        [
+            "member_name",
+            "phone",
+            "id",
+            "spec_kg_per_delivery",
+            "cycle_type",
+            "total_weight",
+            "remaining_weight",
+            "欠费斤数",
+            "卡片状态",
+            "purchase_date",
+        ]
+    ].rename(
+        columns={
+            "member_name": "姓名",
+            "phone": "手机号",
+            "id": "菜卡ID",
+            "spec_kg_per_delivery": "单次规格(斤)",
+            "cycle_type": "卡片周期",
+            "total_weight": "总斤数",
+            "remaining_weight": "当前剩余斤数",
+            "purchase_date": "购卡日期",
+        }
+    )
+
+    st.markdown("#### 欠费会员列表（按购卡时间排序）")
+    st.error("以下会员存在欠费（红色行），请尽快联系续卡。")
+
+    tmp = display_df.copy()
+    tmp.insert(0, "标记", "欠费")
+
+    def esc(x):
+        return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    headers = "".join([f"<th style='padding:6px;border:1px solid #ddd'>{esc(c)}</th>" for c in tmp.columns])
+    rows_html = ""
+    for _, r in tmp.iterrows():
+        rows_html += "<tr style='background-color:#ffcccc'>"
+        for c in tmp.columns:
+            rows_html += f"<td style='padding:6px;border:1px solid #ddd'>{esc(r[c])}</td>"
+        rows_html += "</tr>"
+
+    html = f"""
+    <div style="overflow:auto;max-height:520px;border:1px solid #eee">
+      <table style="border-collapse:collapse;width:100%;font-size:14px">
+        <thead><tr style="position:sticky;top:0;background:#fafafa">{headers}</tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# =====================
+# 主应用入口
+# =====================
+
+def main():
+    st.sidebar.title("蔬菜配送会员管理系统")
+
+    # 注意：在重构后，这里只需要跑 B 端后台，因为 C 端我们分离到独立文件了。
+    # 为了防止你这里报错，我已经把 C 端入口去掉了，这是纯粹的老板后台！
+    module = st.sidebar.radio(
+        "选择模块",
+        [
+            "模块1：开卡与会员管理",
+            "模块2：批量/手动 配送扣卡",
+            "模块3：数据看板与日结汇总",
+            "模块4：数据库原始表查询",
+            "模块5：欠费续卡提醒",
+        ],
+    )
+
+    if module.startswith("模块1"):
+        page_open_card_manage()
+    elif module.startswith("模块2"):
+        page_batch_and_manual_deduction()
+    elif module.startswith("模块3"):
+        page_dashboard()
+    elif module.startswith("模块4"):
+        page_db_admin()
+    elif module.startswith("模块5"):
+        page_debt_reminder()
+
+if __name__ == "__main__":
+    main()

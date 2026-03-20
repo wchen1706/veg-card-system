@@ -64,7 +64,7 @@ def _cycle_to_deliveries(cycle_type: str) -> int:
     raise ValueError("Invalid cycle_type")
 
 def create_card_with_debt_fill(
-    member_id: int, spec_kg: int, cycle_type: str, purchase_date
+    member_id: int, spec_kg: int, cycle_type: str, purchase_date, operator: str = "系统"
 ) -> int:
     total_deliveries = _cycle_to_deliveries(cycle_type)
     total_weight = float(spec_kg * total_deliveries)
@@ -138,10 +138,10 @@ def create_card_with_debt_fill(
                     """
                     INSERT INTO records (
                         card_id, member_id, op_date, delivery_date,
-                        weight, status, created_at
+                        weight, status, created_at, operator
                     ) VALUES (
                         :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
-                        :weight, :status, (NOW() AT TIME ZONE 'PRC')
+                        :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
                     )
                     """
                 ),
@@ -149,6 +149,7 @@ def create_card_with_debt_fill(
                     "card_id": new_card_id, "member_id": member_id,
                     "weight": float(offset),
                     "status": f"新卡自动抵扣旧卡欠费 {float(offset):.2f} 斤（旧卡ID:{int(old_id)}）",
+                    "operator": operator
                 },
             )
 
@@ -179,9 +180,8 @@ def choose_card_for_deduction(phone: str) -> Optional[Dict[str, Any]]:
         return None
     return df.iloc[0].to_dict()
 
-def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Dict[str, Any]:
+def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", operator: str = "系统") -> Dict[str, Any]:
     with engine.begin() as connection:
-        # 1. 锁住并获取当前卡的记录
         card = connection.execute(
             text(
                 """
@@ -203,16 +203,15 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
         member_id = int(card["member_id"])
         after_remain = before_remain - float(weight)
 
-        # 2. 先在当前卡上完整记录本次扣减的流水 (无论是否超额)
         connection.execute(
             text(
                 """
                 INSERT INTO records (
                     card_id, member_id, op_date, delivery_date,
-                    weight, status, created_at
+                    weight, status, created_at, operator
                 ) VALUES (
                     :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
-                    :weight, :status, (NOW() AT TIME ZONE 'PRC')
+                    :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
                 )
                 """
             ),
@@ -221,14 +220,12 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
                 "member_id": member_id,
                 "weight": float(weight),
                 "status": status,
+                "operator": operator
             },
         )
 
-        # 3. 跨卡自动抵扣逻辑
         if after_remain < 0:
             current_debt = -after_remain
-            
-            # 查找名下其他有余额的卡（排除自己）
             active_cards = connection.execute(
                 text(
                     """
@@ -250,26 +247,23 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
                     
                 b_remaining = float(b_remaining)
                 offset = min(current_debt, b_remaining)
-                
                 new_b_remaining = b_remaining - offset
                 b_status = compute_card_status(float(b_total), new_b_remaining)
                 
-                # 扣除另一张卡
                 connection.execute(
                     text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
                     {"rw": new_b_remaining, "st": b_status, "id": int(b_id)},
                 )
                 
-                # 在另一张卡生成抵扣流水
                 connection.execute(
                     text(
                         """
                         INSERT INTO records (
                             card_id, member_id, op_date, delivery_date,
-                            weight, status, created_at
+                            weight, status, created_at, operator
                         ) VALUES (
                             :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
-                            :weight, :status, (NOW() AT TIME ZONE 'PRC')
+                            :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
                         )
                         """
                     ),
@@ -278,13 +272,13 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
                         "member_id": member_id,
                         "weight": float(offset),
                         "status": f"跨卡自动抵扣欠费（原卡ID:{card_id}）",
+                        "operator": operator
                     },
                 )
                 
                 current_debt -= offset
-                after_remain += offset  # 把 A 卡的负债抹平
+                after_remain += offset 
         
-        # 4. 更新A卡最终的余额和状态
         new_status = compute_card_status(total, after_remain)
         connection.execute(
             text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
@@ -300,18 +294,18 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
         "card_id": card_id,
     }
 
-def insert_retail_record(weight: float, status: str = "非会员零售"):
+def insert_retail_record(weight: float, status: str = "非会员零售", operator: str = "系统"):
     execute_query(
         """
         INSERT INTO records (
             card_id, member_id, op_date, delivery_date,
-            weight, status, created_at
+            weight, status, created_at, operator
         ) VALUES (
             NULL, NULL, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
-            :weight, :status, (NOW() AT TIME ZONE 'PRC')
+            :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
         )
         """,
-        {"weight": float(weight), "status": status},
+        {"weight": float(weight), "status": status, "operator": operator},
     )
 
 def update_record_weight(record_id: int, new_weight: float):

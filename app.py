@@ -375,18 +375,30 @@ def manual_deduction_ui():
             st.warning(f"⚠️ 少点 {diff:.2f} 斤，请提醒客户确认。")
 
         try:
-            res = q.deduct_card(card_id, weight, status="手动扣卡")
+            res = q.deduct_card(card_id, weight, status="手动扣卡", operator=st.session_state.operator)
             real_after = res["after_remain"]
+            cross_amt = res.get("cross_amount", 0.0)      # 拿到跨卡斤数
+            cross_ids = res.get("cross_card_ids", "")     # 拿到备用卡号
             
             st.toast("扣卡成功！", icon="✅")
-            st.success(f"✅ 成功扣除：{weight:.2f} 斤 | 会员：{res['member_name']}")
             
-            if real_after < 0:
-                st.error(f"🚨 警报：该会员所有备用卡均已扣空！当前产生真实欠费 {abs(real_after):.2f} 斤，请务必提醒客户续费。")
+            # 👑 全新智能分级提示
+            if cross_amt > 0:
+                # 触发了跨卡抵扣
+                st.warning(
+                    f"🔄 **跨卡抵扣触发**：本次共扣 {weight} 斤。当前卡片已用完，"
+                    f"超出的 **{cross_amt:.2f} 斤** 已自动从该会员的备用卡 (卡号: {cross_ids}) 中安全扣除！"
+                )
+            elif real_after < 0:
+                # 连备用卡都不够扣，产生真正的欠费
+                st.error(f"🚨 **警报**：该会员所有备用卡均已扣空！当前产生真实欠费 **{abs(real_after):.2f} 斤**，请务必提醒客户续费。")
             elif real_after == 0:
-                st.warning("⚠️ 提醒：该卡片刚才已刚好用完（余额 0 斤），请提醒客户下次准备续费。")
+                # 刚好扣完
+                st.success(f"✅ 成功扣除：{weight:.2f} 斤。")
+                st.warning("⚠️ **提醒**：该卡片刚才已刚好用完（余额 0 斤），请提醒客户下次准备续费。")
             else:
-                st.info(f"💳 本次扣除后，该卡最新剩余：{real_after:.2f} 斤")
+                # 正常扣除还有结余
+                st.success(f"✅ 成功扣除：{weight:.2f} 斤 | 会员：{res['member_name']} | 最新剩余：{real_after:.2f} 斤")
                 
         except Exception as e:
             st.error(f"❌ 扣卡失败：{e}")
@@ -440,80 +452,117 @@ def admin_db_browser():
 
 
 def edit_records_ui():
-    st.markdown("#### 修改历史扣卡记录（同步调整菜卡余额）")
+    st.markdown("#### ⚖️ 历史流水与退补调账")
+    st.info("💡 财务规范：系统已禁止直接篡改或删除历史流水。如遇错扣、漏扣，请通过下方的「调账」功能为该卡片新增一笔冲销记录，做到账目绝对可追溯。")
 
-    search = st.text_input("搜索关键字（手机号 / 姓名 / 状态等）", "")
+    # ==========================================
+    # 第一部分：保留你原有的优秀功能 —— 查账表
+    # ==========================================
+    st.markdown("##### 1. 近期扣卡流水 (仅供查阅对账)")
+    search = st.text_input("🔍 搜索历史流水（手机号 / 姓名 / 状态等）", "")
 
-    # 替换为 q.run_query
     df = q.run_query(
         """
         SELECT records.*, members.name AS member_name, members.phone
         FROM records
         LEFT JOIN members ON records.member_id = members.id
-        ORDER BY records.id DESC
+        ORDER BY records.id DESC LIMIT 200
         """
     )
 
     if df.empty:
         st.info("当前暂无扣卡流水记录。")
-        return
-
-    if search.strip():
-        mask = df.astype(str).apply(
-            lambda col: col.str.contains(search.strip(), case=False, na=False)
-        )
-        df_display = df[mask.any(axis=1)].copy()
     else:
-        df_display = df.copy()
+        if search.strip():
+            mask = df.astype(str).apply(
+                lambda col: col.str.contains(search.strip(), case=False, na=False)
+            )
+            df_display = df[mask.any(axis=1)].copy()
+        else:
+            df_display = df.copy()
 
-    st.dataframe(df_display, use_container_width=True)
+        # 展示数据表格
+        st.dataframe(df_display, use_container_width=True)
 
-    if df_display.empty:
-        return
+    st.markdown("---")
 
-    st.markdown("**选择一条记录进行修改或删除：**")
-
-    labels = []
-    id_map = {}
-    for _, r in df_display.iterrows():
-        label = f"ID:{r['id']} | 扣卡:{r['op_date']} | 配送:{r['delivery_date']} | 斤数:{r['weight']} | 状态:{r['status']}"
-        if "member_name" in r and pd.notna(r["member_name"]):
-            label += f" | 姓名:{r['member_name']}"
-        if "phone" in r and pd.notna(r["phone"]):
-            label += f" | 手机:{r['phone']}"
-        labels.append(label)
-        id_map[label] = int(r["id"])
-
-    selected_label = st.selectbox("选择记录", labels)
-    selected_id = id_map[selected_label]
-    selected_row = df_display[df_display["id"] == selected_id].iloc[0]
-
-    new_weight = st.number_input(
-        "调整后的实发斤数（将同步调整菜卡余额）",
-        min_value=0.0,
-        step=0.5,
-        value=float(selected_row["weight"]),
+    # ==========================================
+    # 第二部分：全新的正规退补调账引擎
+    # ==========================================
+    st.markdown("##### 2. 💳 卡片余额退补调账")
+    
+    # 这里的 SQL 不加 remaining_weight > 0 的限制，因为用完的卡也可能需要退还斤数
+    df_cards = q.run_query(
+        """
+        SELECT cards.*, members.name AS member_name, members.phone, members.wechat_name
+        FROM cards
+        JOIN members ON cards.member_id = members.id
+        ORDER BY members.name ASC, cards.id DESC
+        """
     )
 
-    col_u, col_d = st.columns(2)
-    with col_u:
-        if st.button("更新该记录斤数", key="btn_update_record"):
-            try:
-                q.update_record_weight(selected_id, new_weight)
-                st.success(
-                    f"记录 ID {selected_id} 的斤数已更新为 {new_weight}，对应菜卡余额已自动同步调整。"
-                )
-            except Exception as e:
-                st.error(f"更新失败：{e}")
-    with col_d:
-        if st.button("删除该记录", key="btn_delete_record"):
-            try:
-                q.delete_record(selected_id)
-                st.success(
-                    f"记录 ID {selected_id} 已删除，对应菜卡余额已自动回滚。"
-                )
-            except Exception as e:
-                st.error(f"删除失败：{e}")
+    if df_cards.empty:
+        st.warning("当前没有卡片记录，无法调账。")
+        return
+
+    search_kw = st.text_input("🔍 搜索要调账的会员菜卡 (姓名/手机/微信)：", "", key="search_adj")
+
+    options = []
+    for _, r in df_cards.iterrows():
+        rem_w = float(r["remaining_weight"])
+        wechat = r.get("wechat_name", "未填")
+        phone = r["phone"]
+        name = r["member_name"]
+        
+        # 继续沿用你最喜欢的极简排版
+        display = f"{name}({wechat},{phone}),剩{rem_w}斤|卡{r['id']}"
+        
+        if search_kw and search_kw not in display:
+            continue
+        options.append((display, r.to_dict()))
+
+    if not options:
+        st.warning("👻 未找到匹配的卡片。")
+        return
+
+    labels = [o[0] for o in options]
+    selected_label = st.selectbox("👇 选择需要调账的菜卡", labels, key="select_adj")
+    
+    selected_row = None
+    for label, r in options:
+        if label == selected_label:
+            selected_row = r
+            break
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        adj_type = st.radio("🔄 调账类型", ["➕ 退还斤数 (把多扣的还回去)", "➖ 补扣斤数 (把漏扣的补回来)"])
+    with col2:
+        adj_amount = st.number_input("⚖️ 调整斤数 (绝对值)", min_value=0.0, step=0.5, value=0.0)
+
+    reason = st.text_input("📝 调账原因备注 (必填项，例：刚才多扣了0.5斤，现退回)", "")
+
+    if st.button("⚖️ 确认生成调账凭证"):
+        if adj_amount <= 0:
+            st.error("调整斤数必须大于 0！")
+            return
+        if not reason.strip():
+            st.error("🚨 请务必填写调账/修改原因，以备核查！")
+            return
+
+        weight_delta = adj_amount if "退还" in adj_type else -adj_amount
+        try:
+            old_r, new_r = q.adjust_card_balance(
+                card_id=selected_row["id"], 
+                weight_delta=weight_delta, 
+                reason=reason.strip(),
+                operator=st.session_state.operator
+            )
+            st.toast("调账成功！", icon="✅")
+            st.success(f"✅ 冲销记录已生成！该卡原余额: **{old_r:.2f} 斤** ➡️ 最新余额: **{new_r:.2f} 斤**。流水已永久记录。")
+            
+        except Exception as e:
+            st.error(f"❌ 修改/调账失败: {e}")
 
 
 def page_batch_and_manual_deduction():
@@ -701,7 +750,7 @@ def page_debt_reminder():
 # 主应用入口
 # =====================
 
-def main():   
+def main():
     # ======= 👑 登录拦截器开始 =======
     if "operator" not in st.session_state:
         st.session_state.operator = None

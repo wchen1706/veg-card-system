@@ -312,7 +312,7 @@ def delete_record(record_id: int):
         connection.execute(text("DELETE FROM records WHERE id = :id"), {"id": record_id})
 
 def query_records_with_join(date_field: str, start_date, end_date) -> pd.DataFrame:
-    return run_query(
+    df = run_query(
         f"""
         SELECT
             records.*,
@@ -331,6 +331,17 @@ def query_records_with_join(date_field: str, start_date, end_date) -> pd.DataFra
         params={"start": start_date, "end": end_date}
     )
 
+    # 👑 终极防御：强制将所有日期时间列转换为干净的字符串，彻底干掉 Streamlit Arrow 序列化报错！
+    if not df.empty:
+        # 处理纯日期
+        for col in ['op_date', 'delivery_date']:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d').replace('NaT', '')
+        # 处理带时分秒的时间
+        if 'created_at' in df.columns:
+            df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S').replace('NaT', '')
+
+    return df
 def get_member_cards(member_id: int) -> pd.DataFrame:
     return run_query(
         """
@@ -364,3 +375,55 @@ def debt_cards() -> pd.DataFrame:
         ORDER BY cards.purchase_date ASC, cards.id ASC
         """
     )
+
+def adjust_card_balance(card_id: int, weight_delta: float, reason: str, operator: str = "系统") -> Tuple[float, float]:
+    """
+    手动调整卡片余额（退补/冲销）
+    weight_delta: 正数表示加回来（退还多扣的），负数表示额外扣除（补扣漏扣的）
+    """
+    with engine.begin() as connection:
+        card = connection.execute(
+            text("SELECT * FROM cards WHERE id = :card_id FOR UPDATE"),
+            {"card_id": card_id},
+        ).mappings().fetchone()
+        
+        if not card:
+            raise ValueError("未找到该卡片")
+
+        total = float(card["total_weight"])
+        old_remain = float(card["remaining_weight"])
+        new_remain = old_remain + weight_delta
+        
+        # 1. 更新卡片的新余额和新状态
+        new_status = compute_card_status(total, new_remain)
+        connection.execute(
+            text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
+            {"rw": new_remain, "st": new_status, "id": card_id},
+        )
+        
+        # 2. 新增一条冲销/调整流水
+        # 这里的 weight 在数据库代表“消耗了多少斤”。
+        # 如果是退还斤数（weight_delta为正），说明消耗量是负的；如果是补扣（weight_delta为负），消耗量是正的。
+        record_weight = -weight_delta 
+        
+        connection.execute(
+            text(
+                """
+                INSERT INTO records (
+                    card_id, member_id, op_date, delivery_date,
+                    weight, status, created_at, operator
+                ) VALUES (
+                    :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
+                    :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
+                )
+                """
+            ),
+            {
+                "card_id": card_id,
+                "member_id": int(card["member_id"]),
+                "weight": float(record_weight),
+                "status": f"【财务调账】: {reason}",
+                "operator": operator
+            },
+        )
+        return old_remain, new_remain

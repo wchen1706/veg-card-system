@@ -771,11 +771,21 @@ def main():
             # 这里的名字你可以随便改成你们真实的店员名字
             staff_list = ["👨‍💼 店长 (glj)", "👩‍🌾 店员 (ccc)", "🧑‍💻 店员 (glx)"]
             selected_staff = st.selectbox("当前值班人员", staff_list)
+
+            # 🔐 新增：授权码输入框（隐藏输入内容）
+            auth_code = st.text_input("请输入门店授权码", type="password")
+            
+            # 从云端保险箱取密码，如果取不到，默认用一个备用的
+            correct_password = st.secrets.get("auth_password", "admin123")
             
             if st.button("🚀 登 入 系 统", use_container_width=True):
-                st.session_state.operator = selected_staff
-                st.rerun() # 刷新页面，进入主系统
-        return # 核心：直接 return，不让后面的侧边栏和主菜单加载出来
+                # 这里设置一个你自己才知道的暗号，比如 'ssy888'
+                if auth_code == correct_password: 
+                    st.session_state.operator = selected_staff
+                    st.rerun()
+                else:
+                    st.error("❌ 授权码错误，无法进入系统")
+    return # 核心：直接 return，不让后面的侧边栏和主菜单加载出来
     # ======= 👑 登录拦截器结束 =======
 
     # ======= 已登录状态 =======

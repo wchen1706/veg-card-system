@@ -246,7 +246,7 @@ def batch_deduction_ui():
                     before_remain = float(row["剩余斤数(扣前)"])
                     after_remain = before_remain - weight
                     try:
-                        q.deduct_card(card_id, weight, status="成功扣卡")
+                        q.deduct_card(card_id, weight, status="成功扣卡",operator=st.session_state.operator)
                         success_count += 1
                         st.write(
                             f"会员：{row['姓名']} / {row['手机号']} | 扣前：{before_remain:.2f} 斤 | 扣除：{weight:.2f} 斤 | 扣后：{after_remain:.2f} 斤"
@@ -294,7 +294,7 @@ def batch_deduction_ui():
                 retail = st.button("散客单买", key=f"retail_{idx}")
 
             if retail:
-                q.insert_retail_record(float(row["实发斤数"]), status="非会员零售")
+                q.insert_retail_record(float(row["实发斤数"]), status="非会员零售", operator=st.session_state.operator)
                 st.success(f"已作为散客单买记录写入：{row['姓名']} / {row['实发斤数']}斤")
             elif ignore:
                 st.info(f"已忽略：{row['姓名']} / {row['手机号']}")
@@ -702,6 +702,40 @@ def page_debt_reminder():
 # =====================
 
 def main():
+    def main():
+    # ======= 👑 登录拦截器开始 =======
+    if "operator" not in st.session_state:
+        st.session_state.operator = None
+
+    # 如果没有登录（没选员工），就只显示登录页，隐藏整个系统
+    if not st.session_state.operator:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("<h2 style='text-align: center;'>🥬门店管理系统</h2>", unsafe_allow_html=True)
+        st.markdown("<h5 style='text-align: center; color: gray;'>请选择您的操作员身份进入系统</h5>", unsafe_allow_html=True)
+        
+        # 居中排版
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            # 这里的名字你可以随便改成你们真实的店员名字
+            staff_list = ["👨‍💼 店长 (glj)", "👩‍🌾 店员 (ccc)", "🧑‍💻 店员 (glx)"]
+            selected_staff = st.selectbox("当前值班人员", staff_list)
+            
+            if st.button("🚀 登 入 系 统", use_container_width=True):
+                st.session_state.operator = selected_staff
+                st.rerun() # 刷新页面，进入主系统
+        return # 核心：直接 return，不让后面的侧边栏和主菜单加载出来
+    # ======= 👑 登录拦截器结束 =======
+
+    # ======= 已登录状态 =======
+    # 增加退出登录和当前身份展示
+    st.sidebar.markdown(f"**🟢 当前在线：{st.session_state.operator}**")
+    if st.sidebar.button("🚪 退出登录"):
+        st.session_state.operator = None
+        st.rerun()
+    st.sidebar.markdown("---")
+    
+
     st.sidebar.title("蔬菜配送会员管理系统")
 
     # 注意：在重构后，这里只需要跑 B 端后台，因为 C 端我们分离到独立文件了。

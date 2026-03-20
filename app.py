@@ -661,7 +661,10 @@ def page_dashboard():
     )
 
     st.markdown("#### 明细列表")
+    # 👑 终极清理：剔除所有重复的列名（保留第一个），专治 Arrow 引擎崩溃！
+    display_df = display_df.loc[:, ~display_df.columns.duplicated()]
     st.dataframe(display_df, use_container_width=True)
+    
 
 
 def page_db_admin():

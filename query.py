@@ -7,13 +7,12 @@ from typing import Any, Dict, Optional, Tuple
 # 1. 建立数据库云端引擎
 @st.cache_resource
 def init_engine():
-    # 这里会自动去读 secrets.toml 里的 postgresql+pg8000 链接
     db_url = st.secrets["connections"]["supabase"]["url"]
     return create_engine(db_url)
 
 engine = init_engine()
 
-# 2. 专属查询函数（替换以前的 conn.query）
+# 2. 专属查询函数
 def run_query(sql_str, params=None):
     with engine.connect() as connection:
         return pd.read_sql(text(sql_str), connection, params=params)
@@ -22,7 +21,6 @@ def run_query(sql_str, params=None):
 def execute_query(sql_str, params=None):
     with engine.begin() as connection:
         connection.execute(text(sql_str), params)
-
 
 def compute_card_status(total_weight: float, remaining_weight: float) -> str:
     if remaining_weight < 0:
@@ -33,7 +31,6 @@ def compute_card_status(total_weight: float, remaining_weight: float) -> str:
         return "未使用新卡"
     return "使用中"
 
-
 def get_member_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     df = run_query(
         "SELECT * FROM members WHERE phone = :phone LIMIT 1",
@@ -43,21 +40,19 @@ def get_member_by_phone(phone: str) -> Optional[Dict[str, Any]]:
         return None
     return df.iloc[0].to_dict()
 
-
 def create_member(name: str, wechat_name: str, phone: str) -> int:
     with engine.begin() as connection:
         row = connection.execute(
             text(
                 """
                 INSERT INTO members (name, wechat_name, phone, created_at)
-                VALUES (:name, :wechat_name, :phone, NOW())
+                VALUES (:name, :wechat_name, :phone, (NOW() AT TIME ZONE 'PRC'))
                 RETURNING id
                 """
             ),
             {"name": name, "wechat_name": wechat_name, "phone": phone},
         ).fetchone()
         return int(row[0])
-
 
 def _cycle_to_deliveries(cycle_type: str) -> int:
     if cycle_type == "month":
@@ -68,14 +63,12 @@ def _cycle_to_deliveries(cycle_type: str) -> int:
         return 50
     raise ValueError("Invalid cycle_type")
 
-
 def create_card_with_debt_fill(
     member_id: int, spec_kg: int, cycle_type: str, purchase_date
 ) -> int:
     total_deliveries = _cycle_to_deliveries(cycle_type)
     total_weight = float(spec_kg * total_deliveries)
 
-    # 复杂的跨表操作，必须使用 engine.begin() 保证事务一致性
     with engine.begin() as connection:
         new_card_id = int(
             connection.execute(
@@ -147,8 +140,8 @@ def create_card_with_debt_fill(
                         card_id, member_id, op_date, delivery_date,
                         weight, status, created_at
                     ) VALUES (
-                        :card_id, :member_id, CURRENT_DATE, CURRENT_DATE,
-                        :weight, :status, NOW()
+                        :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
+                        :weight, :status, (NOW() AT TIME ZONE 'PRC')
                     )
                     """
                 ),
@@ -167,7 +160,6 @@ def create_card_with_debt_fill(
 
     return new_card_id
 
-
 def get_active_cards_by_phone(phone: str) -> pd.DataFrame:
     return run_query(
         """
@@ -181,16 +173,15 @@ def get_active_cards_by_phone(phone: str) -> pd.DataFrame:
         params={"phone": phone}
     )
 
-
 def choose_card_for_deduction(phone: str) -> Optional[Dict[str, Any]]:
     df = get_active_cards_by_phone(phone)
     if df.empty:
         return None
     return df.iloc[0].to_dict()
 
-
 def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Dict[str, Any]:
     with engine.begin() as connection:
+        # 1. 锁住并获取当前卡的记录
         card = connection.execute(
             text(
                 """
@@ -209,14 +200,10 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
 
         before_remain = float(card["remaining_weight"])
         total = float(card["total_weight"])
+        member_id = int(card["member_id"])
         after_remain = before_remain - float(weight)
-        new_status = compute_card_status(total, after_remain)
 
-        connection.execute(
-            text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
-            {"rw": after_remain, "st": new_status, "id": card_id},
-        )
-
+        # 2. 先在当前卡上完整记录本次扣减的流水 (无论是否超额)
         connection.execute(
             text(
                 """
@@ -224,17 +211,84 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
                     card_id, member_id, op_date, delivery_date,
                     weight, status, created_at
                 ) VALUES (
-                    :card_id, :member_id, CURRENT_DATE, CURRENT_DATE + INTERVAL '2 day',
-                    :weight, :status, NOW()
+                    :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
+                    :weight, :status, (NOW() AT TIME ZONE 'PRC')
                 )
                 """
             ),
             {
                 "card_id": card_id,
-                "member_id": int(card["member_id"]),
+                "member_id": member_id,
                 "weight": float(weight),
                 "status": status,
             },
+        )
+
+        # 3. 跨卡自动抵扣逻辑
+        if after_remain < 0:
+            current_debt = -after_remain
+            
+            # 查找名下其他有余额的卡（排除自己）
+            active_cards = connection.execute(
+                text(
+                    """
+                    SELECT id, total_weight, remaining_weight
+                    FROM cards
+                    WHERE member_id = :member_id
+                      AND remaining_weight > 0
+                      AND id != :card_id
+                    ORDER BY purchase_date ASC, id ASC
+                    FOR UPDATE
+                    """
+                ),
+                {"member_id": member_id, "card_id": card_id},
+            ).fetchall()
+
+            for b_id, b_total, b_remaining in active_cards:
+                if current_debt <= 0:
+                    break
+                    
+                b_remaining = float(b_remaining)
+                offset = min(current_debt, b_remaining)
+                
+                new_b_remaining = b_remaining - offset
+                b_status = compute_card_status(float(b_total), new_b_remaining)
+                
+                # 扣除另一张卡
+                connection.execute(
+                    text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
+                    {"rw": new_b_remaining, "st": b_status, "id": int(b_id)},
+                )
+                
+                # 在另一张卡生成抵扣流水
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO records (
+                            card_id, member_id, op_date, delivery_date,
+                            weight, status, created_at
+                        ) VALUES (
+                            :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
+                            :weight, :status, (NOW() AT TIME ZONE 'PRC')
+                        )
+                        """
+                    ),
+                    {
+                        "card_id": int(b_id),
+                        "member_id": member_id,
+                        "weight": float(offset),
+                        "status": f"跨卡自动抵扣欠费（原卡ID:{card_id}）",
+                    },
+                )
+                
+                current_debt -= offset
+                after_remain += offset  # 把 A 卡的负债抹平
+        
+        # 4. 更新A卡最终的余额和状态
+        new_status = compute_card_status(total, after_remain)
+        connection.execute(
+            text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
+            {"rw": after_remain, "st": new_status, "id": card_id},
         )
 
     return {
@@ -246,7 +300,6 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡") -> Di
         "card_id": card_id,
     }
 
-
 def insert_retail_record(weight: float, status: str = "非会员零售"):
     execute_query(
         """
@@ -254,13 +307,12 @@ def insert_retail_record(weight: float, status: str = "非会员零售"):
             card_id, member_id, op_date, delivery_date,
             weight, status, created_at
         ) VALUES (
-            NULL, NULL, CURRENT_DATE, CURRENT_DATE + INTERVAL '2 day',
-            :weight, :status, NOW()
+            NULL, NULL, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
+            :weight, :status, (NOW() AT TIME ZONE 'PRC')
         )
         """,
         {"weight": float(weight), "status": status},
     )
-
 
 def update_record_weight(record_id: int, new_weight: float):
     with engine.begin() as connection:
@@ -297,7 +349,6 @@ def update_record_weight(record_id: int, new_weight: float):
                     {"rw": new_remaining, "st": new_status, "id": int(card_id)},
                 )
 
-
 def delete_record(record_id: int):
     with engine.begin() as connection:
         rec = connection.execute(
@@ -329,7 +380,6 @@ def delete_record(record_id: int):
 
         connection.execute(text("DELETE FROM records WHERE id = :id"), {"id": record_id})
 
-
 def query_records_with_join(date_field: str, start_date, end_date) -> pd.DataFrame:
     return run_query(
         f"""
@@ -350,7 +400,6 @@ def query_records_with_join(date_field: str, start_date, end_date) -> pd.DataFra
         params={"start": start_date, "end": end_date}
     )
 
-
 def get_member_cards(member_id: int) -> pd.DataFrame:
     return run_query(
         """
@@ -361,7 +410,6 @@ def get_member_cards(member_id: int) -> pd.DataFrame:
         """,
         params={"mid": member_id}
     )
-
 
 def get_recent_records(member_id: int, limit: int = 10) -> pd.DataFrame:
     return run_query(
@@ -374,7 +422,6 @@ def get_recent_records(member_id: int, limit: int = 10) -> pd.DataFrame:
         """,
         params={"mid": member_id, "lim": limit}
     )
-
 
 def debt_cards() -> pd.DataFrame:
     return run_query(

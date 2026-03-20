@@ -310,7 +310,7 @@ def batch_deduction_ui():
 def manual_deduction_ui():
     st.markdown("#### 单独手动扣卡")
 
-    # 替换为 q.run_query
+    # 获取包含有效菜卡的数据
     df_cards = q.run_query(
         """
         SELECT cards.*, members.name AS member_name, members.phone
@@ -327,18 +327,20 @@ def manual_deduction_ui():
 
     options = []
     for _, r in df_cards.iterrows():
-        total_w = float(r["total_weight"])
         rem_w = float(r["remaining_weight"])
-        status = compute_card_status(total_w, rem_w)
+        
+        # 👑 核心 UX 优化：把“剩余斤数”和“姓名”顶在最前面，防止手机端截断！
         display = (
-            f"{r['member_name']}({r['phone']}) - 卡ID:{r['id']} - "
-            f"{r['spec_kg_per_delivery']}斤 {r['cycle_type']} "
-            f"剩余:{rem_w}斤 状态:{status}"
+            f"[剩 {rem_w}斤] {r['member_name']}({r['phone'][-4:]}) - "
+            f"规格:{r['spec_kg_per_delivery']}斤 - 卡号:{r['id']}"
         )
         options.append((display, r.to_dict()))
 
     labels = [o[0] for o in options]
-    selected_label = st.selectbox("选择需要扣卡的会员菜卡（支持输入姓名搜索）", labels)
+    
+    # 依然保留 selectbox，保证店长可以通过打字快速搜索会员
+    selected_label = st.selectbox("请选择要扣除的菜卡（支持打字搜索姓名）👇", labels)
+    
     selected_row = None
     for label, r in options:
         if label == selected_label:
@@ -353,7 +355,6 @@ def manual_deduction_ui():
             return
 
         card_id = selected_row["id"]
-        remaining = float(selected_row["remaining_weight"])
         spec_kg = int(selected_row["spec_kg_per_delivery"])
 
         if weight < spec_kg:
@@ -361,19 +362,23 @@ def manual_deduction_ui():
             st.warning(f"⚠️ 少点 {diff:.2f} 斤，请提醒客户确认。")
 
         try:
-            before_remain = remaining
-            after_remain = before_remain - weight
-            q.deduct_card(card_id, weight, status="成功扣卡")
-            st.success(
-                f"手动扣卡成功。会员：{selected_row['member_name']}({selected_row['phone']}) | 扣前：{before_remain:.2f} 斤 | 扣除：{weight:.2f} 斤 | 扣后：{after_remain:.2f} 斤"
-            )
-            if after_remain < 0:
-                st.markdown(
-                    f"<span style='color:red'>当前菜卡已产生欠费 {abs(after_remain):.2f} 斤，请及时提醒客户续卡。</span>",
-                    unsafe_allow_html=True,
-                )
+            # 👑 核心逻辑优化：接收后台“跨卡智能抵扣”返回的最终真实数据
+            res = q.deduct_card(card_id, weight, status="手动扣卡")
+            real_after = res["after_remain"]
+            
+            st.toast("扣卡成功！", icon="✅")
+            st.success(f"✅ 成功扣除：{weight:.2f} 斤 | 会员：{res['member_name']}")
+            
+            # 智能判断前端提示
+            if real_after < 0:
+                st.error(f"🚨 警报：该会员所有备用卡均已扣空！当前产生真实欠费 {abs(real_after):.2f} 斤，请务必提醒客户续费。")
+            elif real_after == 0:
+                st.warning("⚠️ 提醒：该卡片刚才已刚好用完（余额 0 斤），请提醒客户下次准备续费。")
+            else:
+                st.info(f"💳 本次扣除后，该卡最新剩余：{real_after:.2f} 斤")
+                
         except Exception as e:
-            st.error(f"扣卡失败：{e}")
+            st.error(f"❌ 扣卡失败：{e}")
 
 
 def admin_db_browser():

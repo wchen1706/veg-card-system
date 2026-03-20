@@ -140,7 +140,7 @@ def create_card_with_debt_fill(
                         card_id, member_id, op_date, delivery_date,
                         weight, status, created_at, operator
                     ) VALUES (
-                        :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
+                        :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
                         :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
                     )
                     """
@@ -152,7 +152,7 @@ def create_card_with_debt_fill(
                     "operator": operator
                 },
             )
-
+            
         new_status = compute_card_status(total_weight, float(new_remaining))
         connection.execute(
             text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),

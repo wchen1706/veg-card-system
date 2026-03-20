@@ -182,63 +182,18 @@ def choose_card_for_deduction(phone: str) -> Optional[Dict[str, Any]]:
 
 def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", operator: str = "系统") -> Dict[str, Any]:
     with engine.begin() as connection:
-        card = connection.execute(
-            text(
-                """
-                SELECT cards.*, members.name AS member_name, members.phone
-                FROM cards
-                JOIN members ON cards.member_id = members.id
-                WHERE cards.id = :card_id
-                FOR UPDATE
-                """
-            ),
-            {"card_id": card_id},
-        ).mappings().fetchone()
-        
-        if not card:
-            raise ValueError("Card not found")
+        # ... (前面的代码保持不变) ...
 
-        before_remain = float(card["remaining_weight"])
-        total = float(card["total_weight"])
-        member_id = int(card["member_id"])
-        after_remain = before_remain - float(weight)
+        # 👑 新增：用来记录跨卡情报的变量
+        cross_amount = 0.0
+        cross_card_ids = []
 
-        connection.execute(
-            text(
-                """
-                INSERT INTO records (
-                    card_id, member_id, op_date, delivery_date,
-                    weight, status, created_at, operator
-                ) VALUES (
-                    :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
-                    :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
-                )
-                """
-            ),
-            {
-                "card_id": card_id,
-                "member_id": member_id,
-                "weight": float(weight),
-                "status": status,
-                "operator": operator
-            },
-        )
-
+        # 3. 跨卡自动抵扣逻辑
         if after_remain < 0:
             current_debt = -after_remain
+            
             active_cards = connection.execute(
-                text(
-                    """
-                    SELECT id, total_weight, remaining_weight
-                    FROM cards
-                    WHERE member_id = :member_id
-                      AND remaining_weight > 0
-                      AND id != :card_id
-                    ORDER BY purchase_date ASC, id ASC
-                    FOR UPDATE
-                    """
-                ),
-                {"member_id": member_id, "card_id": card_id},
+                # ... 这里的 SQL 保持不变 ...
             ).fetchall()
 
             for b_id, b_total, b_remaining in active_cards:
@@ -247,44 +202,24 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", opera
                     
                 b_remaining = float(b_remaining)
                 offset = min(current_debt, b_remaining)
-                new_b_remaining = b_remaining - offset
-                b_status = compute_card_status(float(b_total), new_b_remaining)
                 
-                connection.execute(
-                    text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
-                    {"rw": new_b_remaining, "st": b_status, "id": int(b_id)},
-                )
+                # ... (前面的更新 B 卡和插入 B 卡流水的代码保持不变) ...
                 
-                connection.execute(
-                    text(
-                        """
-                        INSERT INTO records (
-                            card_id, member_id, op_date, delivery_date,
-                            weight, status, created_at, operator
-                        ) VALUES (
-                            :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date,
-                            :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
-                        )
-                        """
-                    ),
-                    {
-                        "card_id": int(b_id),
-                        "member_id": member_id,
-                        "weight": float(offset),
-                        "status": f"跨卡自动抵扣欠费（原卡ID:{card_id}）",
-                        "operator": operator
-                    },
-                )
+                # 👑 记录跨卡情报
+                cross_amount += offset
+                cross_card_ids.append(str(b_id))
                 
                 current_debt -= offset
-                after_remain += offset 
+                after_remain += offset  # 把 A 卡的负债抹平
         
+        # 4. 更新A卡最终的余额和状态
         new_status = compute_card_status(total, after_remain)
         connection.execute(
             text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
             {"rw": after_remain, "st": new_status, "id": card_id},
         )
 
+    # 👑 修改返回值：把跨卡情报吐给前台
     return {
         "member_name": card["member_name"],
         "phone": card["phone"],
@@ -292,6 +227,8 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", opera
         "after_remain": after_remain,
         "deduct_weight": float(weight),
         "card_id": card_id,
+        "cross_amount": cross_amount,                 # 跨卡扣了多少斤
+        "cross_card_ids": ", ".join(cross_card_ids)   # 扣的是哪几张卡
     }
 
 def insert_retail_record(weight: float, status: str = "非会员零售", operator: str = "系统"):

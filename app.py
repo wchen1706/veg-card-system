@@ -308,12 +308,12 @@ def batch_deduction_ui():
 
 
 def manual_deduction_ui():
-    st.markdown("#### 单独手动扣卡")
+    st.markdown("#### 💳 单独手动扣卡")
 
-    # 获取包含有效菜卡的数据
+    # 1. 修改 SQL：把 wechat_name 也一起查出来！
     df_cards = q.run_query(
         """
-        SELECT cards.*, members.name AS member_name, members.phone
+        SELECT cards.*, members.name AS member_name, members.phone, members.wechat_name
         FROM cards
         JOIN members ON cards.member_id = members.id
         WHERE cards.remaining_weight > 0
@@ -325,21 +325,36 @@ def manual_deduction_ui():
         st.info("当前没有可用的菜卡。")
         return
 
+    # 2. 移动端杀手锏：真正的文本搜索框！点这里绝对能唤起手机键盘！
+    search_kw = st.text_input("🔍 输入姓名、微信或手机号快速筛选：", "")
+
     options = []
     for _, r in df_cards.iterrows():
         rem_w = float(r["remaining_weight"])
+        wechat = r.get("wechat_name", "未填")  # 防空处理
+        phone = r["phone"]
+        name = r["member_name"]
         
-        # 👑 核心 UX 优化：把“剩余斤数”和“姓名”顶在最前面，防止手机端截断！
+        # 3. 完整信息展示：姓名 + 微信 + 完整手机号 + 剩斤数
         display = (
-            f"[剩 {rem_w}斤] {r['member_name']}({r['phone'][-4:]}) - "
-            f"规格:{r['spec_kg_per_delivery']}斤 - 卡号:{r['id']}"
+            f"{name} ({wechat}, 手机:{phone})-"
+            f"[剩{rem_w}斤] 规格:{r['spec_kg_per_delivery']}斤-卡号:{r['id']}"
         )
+        
+        # 4. 智能过滤：如果搜索框有字，且字不在展示内容里，就过滤掉它
+        if search_kw and search_kw not in display:
+            continue
+            
         options.append((display, r.to_dict()))
+
+    if not options:
+        st.warning("👻 没有找到匹配的会员，请检查搜索词。")
+        return
 
     labels = [o[0] for o in options]
     
-    # 依然保留 selectbox，保证店长可以通过打字快速搜索会员
-    selected_label = st.selectbox("请选择要扣除的菜卡（支持打字搜索姓名）👇", labels)
+    # 5. 用 Radio 单选框展示过滤后的结果，手机上长条目会自动换行展示，极其清爽
+    selected_label = st.radio("👇 请选择要扣除的菜卡", labels)
     
     selected_row = None
     for label, r in options:
@@ -347,9 +362,10 @@ def manual_deduction_ui():
             selected_row = r
             break
 
-    weight = st.number_input("实发斤数", min_value=0.0, step=0.5, value=0.0)
+    st.markdown("---")
+    weight = st.number_input("⚖️ 实发斤数", min_value=0.0, step=0.5, value=0.0)
 
-    if st.button("确认手动扣卡"):
+    if st.button("✅ 确认手动扣卡"):
         if weight <= 0:
             st.error("实发斤数必须大于 0。")
             return
@@ -362,14 +378,12 @@ def manual_deduction_ui():
             st.warning(f"⚠️ 少点 {diff:.2f} 斤，请提醒客户确认。")
 
         try:
-            # 👑 核心逻辑优化：接收后台“跨卡智能抵扣”返回的最终真实数据
             res = q.deduct_card(card_id, weight, status="手动扣卡")
             real_after = res["after_remain"]
             
             st.toast("扣卡成功！", icon="✅")
             st.success(f"✅ 成功扣除：{weight:.2f} 斤 | 会员：{res['member_name']}")
             
-            # 智能判断前端提示
             if real_after < 0:
                 st.error(f"🚨 警报：该会员所有备用卡均已扣空！当前产生真实欠费 {abs(real_after):.2f} 斤，请务必提醒客户续费。")
             elif real_after == 0:

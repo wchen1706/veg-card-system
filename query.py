@@ -182,7 +182,49 @@ def choose_card_for_deduction(phone: str) -> Optional[Dict[str, Any]]:
 
 def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", operator: str = "系统") -> Dict[str, Any]:
     with engine.begin() as connection:
-        # ... (前面的代码保持不变) ...
+        # 1. 锁住并获取当前卡的记录
+        card = connection.execute(
+            text(
+                """
+                SELECT cards.*, members.name AS member_name, members.phone
+                FROM cards
+                JOIN members ON cards.member_id = members.id
+                WHERE cards.id = :card_id
+                FOR UPDATE
+                """
+            ),
+            {"card_id": card_id},
+        ).mappings().fetchone()
+        
+        if not card:
+            raise ValueError("Card not found")
+
+        before_remain = float(card["remaining_weight"])
+        total = float(card["total_weight"])
+        member_id = int(card["member_id"])
+        after_remain = before_remain - float(weight)
+
+        # 2. 先在当前卡上完整记录本次扣减的流水 (无论是否超额)
+        connection.execute(
+            text(
+                """
+                INSERT INTO records (
+                    card_id, member_id, op_date, delivery_date,
+                    weight, status, created_at, operator
+                ) VALUES (
+                    :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
+                    :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
+                )
+                """
+            ),
+            {
+                "card_id": card_id,
+                "member_id": member_id,
+                "weight": float(weight),
+                "status": status,
+                "operator": operator
+            },
+        )
 
         # 👑 新增：用来记录跨卡情报的变量
         cross_amount = 0.0
@@ -192,8 +234,20 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", opera
         if after_remain < 0:
             current_debt = -after_remain
             
+            # 查找名下其他有余额的卡（排除自己）
             active_cards = connection.execute(
-                # ... 这里的 SQL 保持不变 ...
+                text(
+                    """
+                    SELECT id, total_weight, remaining_weight
+                    FROM cards
+                    WHERE member_id = :member_id
+                      AND remaining_weight > 0
+                      AND id != :card_id
+                    ORDER BY purchase_date ASC, id ASC
+                    FOR UPDATE
+                    """
+                ),
+                {"member_id": member_id, "card_id": card_id},
             ).fetchall()
 
             for b_id, b_total, b_remaining in active_cards:
@@ -203,7 +257,36 @@ def deduct_card(card_id: int, weight: float, status: str = "成功扣卡", opera
                 b_remaining = float(b_remaining)
                 offset = min(current_debt, b_remaining)
                 
-                # ... (前面的更新 B 卡和插入 B 卡流水的代码保持不变) ...
+                new_b_remaining = b_remaining - offset
+                b_status = compute_card_status(float(b_total), new_b_remaining)
+                
+                # 扣除另一张卡
+                connection.execute(
+                    text("UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"),
+                    {"rw": new_b_remaining, "st": b_status, "id": int(b_id)},
+                )
+                
+                # 👑 修复：在另一张卡生成抵扣流水，配送日期强制 +2 天
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO records (
+                            card_id, member_id, op_date, delivery_date,
+                            weight, status, created_at, operator
+                        ) VALUES (
+                            :card_id, :member_id, (NOW() AT TIME ZONE 'PRC')::date, (NOW() AT TIME ZONE 'PRC')::date + INTERVAL '2 day',
+                            :weight, :status, (NOW() AT TIME ZONE 'PRC'), :operator
+                        )
+                        """
+                    ),
+                    {
+                        "card_id": int(b_id),
+                        "member_id": member_id,
+                        "weight": float(offset),
+                        "status": f"跨卡自动抵扣欠费（原卡ID:{card_id}）",
+                        "operator": operator
+                    },
+                )
                 
                 # 👑 记录跨卡情报
                 cross_amount += offset
@@ -244,72 +327,6 @@ def insert_retail_record(weight: float, status: str = "非会员零售", operato
         """,
         {"weight": float(weight), "status": status, "operator": operator},
     )
-
-def update_record_weight(record_id: int, new_weight: float):
-    with engine.begin() as connection:
-        rec = connection.execute(
-            text("SELECT * FROM records WHERE id = :id FOR UPDATE"),
-            {"id": record_id},
-        ).mappings().fetchone()
-        if not rec:
-            raise ValueError("Record not found")
-
-        old_weight = float(rec["weight"])
-        delta = float(new_weight) - old_weight
-
-        connection.execute(
-            text("UPDATE records SET weight = :w WHERE id = :id"),
-            {"w": float(new_weight), "id": record_id},
-        )
-
-        card_id = rec["card_id"]
-        if card_id is not None:
-            card = connection.execute(
-                text("SELECT * FROM cards WHERE id = :id FOR UPDATE"),
-                {"id": int(card_id)},
-            ).mappings().fetchone()
-            if card:
-                remaining = float(card["remaining_weight"])
-                new_remaining = remaining - delta
-                total = float(card["total_weight"])
-                new_status = compute_card_status(total, new_remaining)
-                connection.execute(
-                    text(
-                        "UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"
-                    ),
-                    {"rw": new_remaining, "st": new_status, "id": int(card_id)},
-                )
-
-def delete_record(record_id: int):
-    with engine.begin() as connection:
-        rec = connection.execute(
-            text("SELECT * FROM records WHERE id = :id FOR UPDATE"),
-            {"id": record_id},
-        ).mappings().fetchone()
-        if not rec:
-            raise ValueError("Record not found")
-
-        weight = float(rec["weight"])
-        card_id = rec["card_id"]
-
-        if card_id is not None:
-            card = connection.execute(
-                text("SELECT * FROM cards WHERE id = :id FOR UPDATE"),
-                {"id": int(card_id)},
-            ).mappings().fetchone()
-            if card:
-                remaining = float(card["remaining_weight"])
-                new_remaining = remaining + weight
-                total = float(card["total_weight"])
-                new_status = compute_card_status(total, new_remaining)
-                connection.execute(
-                    text(
-                        "UPDATE cards SET remaining_weight = :rw, status = :st WHERE id = :id"
-                    ),
-                    {"rw": new_remaining, "st": new_status, "id": int(card_id)},
-                )
-
-        connection.execute(text("DELETE FROM records WHERE id = :id"), {"id": record_id})
 
 def query_records_with_join(date_field: str, start_date, end_date) -> pd.DataFrame:
     df = run_query(

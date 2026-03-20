@@ -755,6 +755,7 @@ def page_debt_reminder():
 
 def main():
     # ======= 👑 登录拦截器开始 =======
+    st.write(st.session_state)
     if "operator" not in st.session_state:
         st.session_state.operator = None
 

@@ -701,8 +701,7 @@ def page_debt_reminder():
 # 主应用入口
 # =====================
 
-def main():
-    def main():
+def main():   
     # ======= 👑 登录拦截器开始 =======
     if "operator" not in st.session_state:
         st.session_state.operator = None

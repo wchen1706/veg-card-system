@@ -310,7 +310,6 @@ def batch_deduction_ui():
 def manual_deduction_ui():
     st.markdown("#### 💳 单独手动扣卡")
 
-    # 1. 修改 SQL：把 wechat_name 也一起查出来！
     df_cards = q.run_query(
         """
         SELECT cards.*, members.name AS member_name, members.phone, members.wechat_name
@@ -325,23 +324,21 @@ def manual_deduction_ui():
         st.info("当前没有可用的菜卡。")
         return
 
-    # 2. 移动端杀手锏：真正的文本搜索框！点这里绝对能唤起手机键盘！
+    # 1. 移动端杀手锏：真正的文本搜索框！点这里唤起手机键盘！
     search_kw = st.text_input("🔍 输入姓名、微信或手机号快速筛选：", "")
 
     options = []
     for _, r in df_cards.iterrows():
         rem_w = float(r["remaining_weight"])
-        wechat = r.get("wechat_name", "未填")  # 防空处理
+        wechat = r.get("wechat_name", "未填")
         phone = r["phone"]
         name = r["member_name"]
         
-        # 3. 完整信息展示：姓名 + 微信 + 完整手机号 + 剩斤数
-        display = (
-            f"{name} ({wechat}, 手机:{phone})-"
-            f"[剩{rem_w}斤] 规格:{r['spec_kg_per_delivery']}斤-卡号:{r['id']}"
-        )
+        # 2. 极限压缩排版！去掉所有冗余汉字，用符号分隔，防止下拉框截断
+        # 展示效果 👉 王大拿(dana88,13800138000) | 剩10斤 | 5斤/次 | 卡12
+        display = f"{name}({wechat},{phone}),剩{rem_w}斤|{r['spec_kg_per_delivery']}斤|卡{r['id']}"
         
-        # 4. 智能过滤：如果搜索框有字，且字不在展示内容里，就过滤掉它
+        # 3. 智能过滤
         if search_kw and search_kw not in display:
             continue
             
@@ -353,8 +350,8 @@ def manual_deduction_ui():
 
     labels = [o[0] for o in options]
     
-    # 5. 用 Radio 单选框展示过滤后的结果，手机上长条目会自动换行展示，极其清爽
-    selected_label = st.radio("👇 请选择要扣除的菜卡", labels)
+    # 4. 换回你熟悉的下拉框！现在因为字数精简了，手机上大概率能完整显示！
+    selected_label = st.selectbox("👇 请选择要扣除的菜卡", labels)
     
     selected_row = None
     for label, r in options:

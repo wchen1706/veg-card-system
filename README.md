@@ -1,4 +1,4 @@
-# 🥬 盛生园 | 智能生鲜门店会员管理系统 (SaaS)
+# 🥬 智能生鲜门店会员管理系统
 
 ![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.32+-red.svg)

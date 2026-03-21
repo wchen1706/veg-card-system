@@ -569,13 +569,13 @@ def page_batch_and_manual_deduction():
     st.subheader("模块2：批量/手动 配送扣卡")
 
     tab1, tab2, tab3 = st.tabs(
-        ["批量粘贴扣卡", "单独手动扣卡", "修改历史扣卡记录"]
+        ["单独手动扣卡", "批量粘贴扣卡", "修改历史扣卡记录"]
     )
 
     with tab1:
-        batch_deduction_ui()
-    with tab2:
         manual_deduction_ui()
+    with tab2:
+        batch_deduction_ui()
     with tab3:
         edit_records_ui()
 

@@ -3,6 +3,44 @@ st.set_page_config(
         page_title="蔬菜配送会员管理系统",
         layout="wide",
     )
+# ======== 👑 新增：UI 极简美化魔法 ========
+def inject_custom_css():
+    st.markdown("""
+        <style>
+        /* 1. 隐藏 Streamlit 默认的右上角菜单和底部水印 (显得更像独立开发的 App) */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        
+        /* 2. 优化顶部留白，让页面内容更紧凑 */
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        
+        /* 3. 美化表单和卡片边框，增加轻微的高级阴影 */
+        div[data-testid="stForm"] {
+            border: 1px solid #f0f2f6;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            padding: 20px;
+        }
+        
+        /* 4. 让主要的按钮显得更立体饱满 */
+        button[kind="primary"] {
+            border-radius: 8px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+        button[kind="primary"]:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+# 调用美化魔法
+inject_custom_css()
 
 import pandas as pd
 from datetime import datetime
@@ -569,13 +607,13 @@ def page_batch_and_manual_deduction():
     st.subheader("模块2：批量/手动 配送扣卡")
 
     tab1, tab2, tab3 = st.tabs(
-        ["批量粘贴扣卡", "单独手动扣卡", "修改历史扣卡记录"]
+        ["单独手动扣卡", "批量粘贴扣卡", "修改历史扣卡记录"]
     )
 
     with tab1:
-        batch_deduction_ui()
-    with tab2:
         manual_deduction_ui()
+    with tab2:
+        batch_deduction_ui()
     with tab3:
         edit_records_ui()
 
@@ -755,7 +793,6 @@ def page_debt_reminder():
 
 def main():
     # ======= 👑 登录拦截器开始 =======
-    st.write(st.session_state)
     if "operator" not in st.session_state:
         st.session_state.operator = None
 

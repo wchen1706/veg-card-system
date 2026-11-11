@@ -8,7 +8,13 @@ from typing import Any, Dict, Optional, Tuple
 @st.cache_resource
 def init_engine():
     db_url = st.secrets["connections"]["supabase"]["url"]
-    return create_engine(db_url)
+
+    # 强制使用 psycopg2 驱动
+    from sqlalchemy.engine import make_url
+    url = make_url(db_url)
+    url = url.set(drivername="postgresql+psycopg2")
+
+    return create_engine(url)
 
 engine = init_engine()
 

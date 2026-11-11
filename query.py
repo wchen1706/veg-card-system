@@ -8,10 +8,17 @@ from typing import Any, Dict, Optional, Tuple
 @st.cache_resource
 def init_engine():
     db_url = st.secrets["connections"]["supabase"]["url"]
+
+    # 明确指定使用 psycopg2 数据库驱动
+    db_url = db_url.replace(
+        "postgresql://",
+        "postgresql+psycopg2://",
+        1
+    )
+
     return create_engine(db_url)
 
 engine = init_engine()
-
 # 2. 专属查询函数
 def run_query(sql_str, params=None):
     with engine.connect() as connection:

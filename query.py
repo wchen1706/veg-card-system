@@ -3,20 +3,18 @@ import pandas as pd
 from sqlalchemy import text, create_engine
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
+from sqlalchemy.engine import make_url
 
 # 1. 建立数据库云端引擎
 @st.cache_resource
 def init_engine():
     db_url = st.secrets["connections"]["supabase"]["url"]
 
-    # 明确指定使用 psycopg2 数据库驱动
-    db_url = db_url.replace(
-        "postgresql://",
-        "postgresql+psycopg2://",
-        1
-    )
+    # 解析数据库 URL，强制指定 psycopg2 驱动
+    url = make_url(db_url)
+    url = url.set(drivername="postgresql+psycopg2")
 
-    return create_engine(db_url)
+    return create_engine(url)
 
 engine = init_engine()
 # 2. 专属查询函数
